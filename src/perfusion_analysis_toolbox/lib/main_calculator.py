@@ -70,7 +70,7 @@ class MainCalculator:
         temp_mask4 = mask.copy()
         vessels = self.vessels
         CTC, BOLUS = ctc.DSC_conc(self.raw_perf, temp_mask)
-        AIF = aif.DSC_aif(
+        AIF = aif.DSC_aif(self,
             temp_mask1,
             CTC,
             BOLUS,
