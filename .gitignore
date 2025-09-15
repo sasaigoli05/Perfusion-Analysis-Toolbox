@@ -9,3 +9,4 @@ trans.hdf5
 src/perfusion_analysis_toolbox/lib/ParamsCalculator/combined_cercare.dcm
 src/perfusion_analysis_toolbox/lib/ParamsCalculator/network_weights/unicarl_preview/longleaf_unicarl_8
 src/perfusion_analysis_toolbox/lib/ParamsCalculator/network_weights/unigradicon1.0/Step_2_final.trch
+network_weights/unicarl_preview/longleaf_unicarl_8
