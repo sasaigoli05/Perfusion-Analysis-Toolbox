@@ -1,0 +1,29 @@
+name: perfusion-analysis-toolbox
+channels:
+  - conda-forge
+dependencies:
+  # Core
+  - python=3.10
+  - pip
+  - numpy=1.26.*          # Stable with SimpleITK and ITK bindings
+  - scipy>=1.10
+  - pandas>=1.5
+  - matplotlib>=3.7
+  - tqdm
+  - click
+  - networkx
+
+  # Imaging + I/O
+  - simpleitk=2.3.*
+  - nibabel>=5.0
+  - pydicom>=2.4
+  - dcm2niix               # for DICOM → NIfTI conversion
+
+  # Optional utilities
+  - psutil
+  - python-dotenv
+
+  # pip-installed packages
+  - pip:
+      # Custom uniGradICON fork with slice-selection heuristic
+      - git+https://github.com/uncbiag/unigradicon.git@unicarl
