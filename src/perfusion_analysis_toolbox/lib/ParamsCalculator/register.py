@@ -29,8 +29,14 @@ def register_and_select_slice(fixed_image_path: str, cta_np: np.ndarray, fixed_s
             "--warped_moving_out", warped_out,
             "--io_iterations", "50"
         ]
-        print("Running uniGradICON registration...")
+
+        print("Running uniGradICON registration on CUDA...")
+        print("Command:", " ".join(cmd))
+
         result = subprocess.run(cmd, capture_output=True, text=True)
+        print(result.stdout)
+        print(result.stderr)
+
         if result.returncode != 0:
             print("Registration failed!")
             print(result.stderr)
