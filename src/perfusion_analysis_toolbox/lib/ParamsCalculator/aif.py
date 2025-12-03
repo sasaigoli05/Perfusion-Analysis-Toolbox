@@ -107,7 +107,7 @@ def extract_AIF(AIFslice, mask, vesselSlice, bolusSlice, savepath, TR=1.55):
     semiaxisMin = 0.1000
 
     nR, nC, nT = AIFslice.shape
-    time = np.arange(0, nT * TR, TR)
+    time = np.arange(nT) * TR
 
     print("[AIF] Brain bound detection")
 

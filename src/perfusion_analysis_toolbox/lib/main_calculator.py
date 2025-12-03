@@ -90,6 +90,26 @@ class MainCalculator:
         mask = self.mask
         vessels = self.vessels
 
+        # ============================
+        # CUDA CHECK BEFORE PIPELINE
+        # ============================
+        import torch
+
+        def check_cuda_or_warn():
+            if torch.cuda.is_available():
+                print("[SYSTEM] CUDA detected — GPU acceleration ENABLED.")
+                return True
+            else:
+                print("\n[WARNING] CUDA GPU NOT AVAILABLE.")
+                print("The pipeline will run on CPU, which may be significantly slower.")
+                answer = input("Proceed with CPU? (y/n): ").strip().lower()
+                if answer != "y":
+                    raise RuntimeError("Execution cancelled — no CUDA device.")
+                print("[SYSTEM] Running in CPU mode...")
+                return False
+       
+        check_cuda_or_warn()
+
         print("[MAIN] Computing CTC/BOLUS...")
         CTC, BOLUS = ctc.DSC_conc(self.raw_perf, mask.copy())
 
