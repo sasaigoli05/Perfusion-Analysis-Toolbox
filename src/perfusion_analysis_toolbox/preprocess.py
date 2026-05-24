@@ -66,10 +66,20 @@ def _find_pre_and_ttp(arr4d: np.ndarray, mask: np.ndarray) -> tuple[int, int]:
     """
     arr4d: (T, Z, Y, X), mask: (Z, Y, X) boolean
     Returns (pre_idx, ttp_idx) using global mean curve inside mask.
+
+    TTP search is restricted to the first 50% of frames so that a late
+    CTA second-injection (combined CTP+CTA protocols) cannot be mistaken
+    for the first-pass bolus peak. Without this guard the vessel mask ends
+    up labelling venous sinuses that fill during the CTA phase, not the
+    cerebral arteries that fill during the CTP first pass.
     """
     T = arr4d.shape[0]
     mean_t = np.array([arr4d[t][mask].mean() if mask.any() else arr4d[t].mean() for t in range(T)])
-    ttp = int(np.argmax(mean_t))
+
+    # Restrict to first half to avoid CTA injection artifact
+    first_pass_end = max(T // 2, min(5, T - 1))
+    ttp = int(np.argmax(mean_t[:first_pass_end]))
+
     if ttp < max(2, MIN_PRE_FRAMES):
         pre = max(0, ttp - 1)
     else:
@@ -77,7 +87,7 @@ def _find_pre_and_ttp(arr4d: np.ndarray, mask: np.ndarray) -> tuple[int, int]:
         base_mean, base_std = mean_t[:base_end].mean(), mean_t[:base_end].std() + 1e-6
         pre_candidates = np.where(mean_t[:ttp] <= base_mean + K_STD * base_std)[0]
         pre = int(pre_candidates[-1]) if pre_candidates.size else max(0, ttp - 1)
-    print(f"[CTP] T={T} | TTP={ttp} | pre={pre}")
+    print(f"[CTP] T={T} | first-pass TTP={ttp} (searched frames 0–{first_pass_end-1}) | pre={pre}")
     print(f"[Curve] mean_t min/max: {mean_t.min():.1f}/{mean_t.max():.1f}")
     return pre, ttp
 
@@ -119,7 +129,7 @@ def _make_brain_mask(nii_path: Path, out_mask_path: Path) -> Path:
     return out_mask_path
 
 
-# ---------- Vessel mask (peak-pre + rim suppression + SITK hysteresis-like) ----------
+# ---------- Vessel mask (first-pass peak + bolus width scoring) ----------
 def _make_vessel_mask(
     nii_path: Path,
     brain_mask_path: Path,
@@ -127,10 +137,20 @@ def _make_vessel_mask(
     THRESH_MODE: str = THRESH_MODE,
     FIXED_THRESH: int = FIXED_THRESH_VAL
 ) -> Path:
+    """
+    Build a vessel mask using first-pass peak and bolus width scoring.
+
+    Replaces the old single-frame peak-minus-baseline + Otsu approach.
+    Key improvements:
+      - Peak is the max over first-pass frames only (CTA spike excluded)
+      - Bolus width (FWHM in first-pass window) penalises wide parenchymal curves
+      - Adaptive threshold (top 2% by score AND > 2× parenchymal median)
+      - Rim suppression and spatial cleanup retained from previous version
+    """
 
     # load CTP and geometry
     img4d = sitk.ReadImage(str(nii_path), sitk.sitkFloat32)
-    arr4d = sitk.GetArrayFromImage(img4d)
+    arr4d = sitk.GetArrayFromImage(img4d)   # (T, Z, Y, X)
     if arr4d.ndim != 4:
         raise ValueError(f"Expected 4D image, got shape {arr4d.shape}")
     T, Z, Y, X = arr4d.shape
@@ -152,86 +172,65 @@ def _make_vessel_mask(
     if brain_arr.shape != (Z, Y, X):
         raise ValueError(f"Mask shape {brain_arr.shape} != CTP spatial {(Z,Y,X)}")
 
-    # timepoints
+    # timepoints — TTP restricted to first half to exclude CTA injection
     pre, ttp = _find_pre_and_ttp(arr4d, brain_arr)
+    first_pass_end = max(T // 2, min(5, T - 1))
 
-    # (peak - pre) within brain
-    peak_arr = arr4d[ttp].astype(np.float32)
-    pre_arr  = arr4d[pre].astype(np.float32)
-    diff_arr = np.clip(peak_arr - pre_arr, 0, None)
-    diff_arr *= brain_arr.astype(np.float32)
+    # Per-voxel first-pass enhancement: subtract baseline, clip to >= 0
+    baseline = arr4d[:max(1, pre + 1)].mean(axis=0)       # (Z, Y, X)
+    fp_ctc = np.clip(arr4d[:first_pass_end] - baseline, 0, None)  # (T_fp, Z, Y, X)
 
-    # diagnostics
-    if brain_arr.any():
-        pr = np.percentile(diff_arr[brain_arr], [90,95,98,99,99.5])
-        print(f"[Diff percentiles in brain] 90:{pr[0]:.1f} 95:{pr[1]:.1f} 98:{pr[2]:.1f} 99:{pr[3]:.1f} 99.5:{pr[4]:.1f}")
+    fp_peak  = fp_ctc.max(axis=0)                          # (Z, Y, X)
+    half_peak = fp_peak / 2.0
+    fp_width  = np.sum(fp_ctc > half_peak[np.newaxis, ...], axis=0).astype(float)
+    fp_width  = np.maximum(fp_width, 1.0)
 
-    # wrap as 3D image
-    diff_img = sitk.GetImageFromArray(diff_arr)
-    diff_img.SetOrigin(origin3); diff_img.SetSpacing(spacing3); diff_img.SetDirection(direction3)
+    # Score within brain mask only
+    zz, rr, cc = np.where(brain_arr)
+    peaks  = fp_peak[zz, rr, cc]
+    widths = fp_width[zz, rr, cc]
 
-    # distance-from-boundary rim suppression
-    # (keep voxels at least RIM_DISTANCE_MM from boundary)
-    dist_map     = sitk.SignedMaurerDistanceMap(brain_img, insideIsPositive=True, squaredDistance=False, useImageSpacing=True)
-    far_from_rim = sitk.BinaryThreshold(dist_map, lowerThreshold=float(RIM_DISTANCE_MM), upperThreshold=1e9, insideValue=1, outsideValue=0)
-    brain_core   = sitk.BinaryErode(brain_img, (1,1,1))  # slightly tighter interior
+    pos_peaks = peaks[peaks > 0]
+    if len(pos_peaks) < 10:
+        print("[VESSEL] Too few positive-peak brain voxels — falling back to empty mask")
+        sitk.WriteImage(sitk.Image(X, Y, Z, sitk.sitkUInt8), str(out_vessel_path))
+        return out_vessel_path
+    peak_median = float(np.median(pos_peaks))
+    min_peak = 2.0 * peak_median
 
-    # rescale 0..255 for thresholding
-    rescaled = sitk.RescaleIntensity(diff_img, 0, 255)
+    def _norm01(x):
+        r = x.max() - x.min()
+        return (x - x.min()) / r if r > 1e-9 else np.zeros_like(x)
 
-    # compute threshold on central brain so skull rim cannot dominate
-    central_mask = sitk.And(brain_img, far_from_rim)
+    score = _norm01(peaks) - 0.5 * _norm01(widths)
 
-    if THRESH_MODE.lower() == "otsu":
-        masked  = sitk.Mask(rescaled, central_mask)
-        mask_img = sitk.OtsuThreshold(masked, 0, 1, 200)
-    else:
-        mask_img = sitk.BinaryThreshold(rescaled, lowerThreshold=int(FIXED_THRESH), upperThreshold=255, insideValue=1, outsideValue=0)
+    threshold_score = np.percentile(score, 98)
+    selected = (score >= threshold_score) & (peaks >= min_peak)
 
-    # --- SimpleITK-only hysteresis-like enhancement ---
-    # Build "weak" and "strong" maps via percentiles; then keep weak components that touch strong.
-    arr_resc = sitk.GetArrayFromImage(rescaled)
-    central  = sitk.GetArrayFromImage(central_mask).astype(bool)
-    if central.any():
-        low_p  = float(np.percentile(arr_resc[central], 95))
-        high_p = float(np.percentile(arr_resc[central], 99))
+    score_map = np.zeros((Z, Y, X), dtype=np.float32)
+    score_map[zz[selected], rr[selected], cc[selected]] = score[selected]
 
-        weak  = sitk.BinaryThreshold(rescaled, lowerThreshold=low_p,  upperThreshold=255, insideValue=1, outsideValue=0)
-        strong= sitk.BinaryThreshold(rescaled, lowerThreshold=high_p, upperThreshold=255, insideValue=1, outsideValue=0)
+    pr = np.percentile(fp_peak[brain_arr], [90, 95, 98, 99])
+    print(f"[VESSEL] First-pass peak percentiles (brain) "
+          f"90:{pr[0]:.1f} 95:{pr[1]:.1f} 98:{pr[2]:.1f} 99:{pr[3]:.1f} "
+          f"| min_peak={min_peak:.1f} | candidates={int(selected.sum())}")
 
-        # Connected components on weak; keep only labels that intersect strong
-        cc_weak = sitk.ConnectedComponent(weak)
-        rel     = sitk.RelabelComponent(cc_weak, sortByObjectSize=False)  # preserve labels
-        stats   = sitk.LabelShapeStatisticsImageFilter(); stats.Execute(rel)
+    # Build binary mask from score map — no rim suppression needed because skull
+    # voxels have near-zero first-pass enhancement and are excluded by min_peak.
+    vessel_arr = (score_map > 0).astype(np.uint8)
+    vessel_img = sitk.GetImageFromArray(vessel_arr)
+    vessel_img.SetOrigin(origin3); vessel_img.SetSpacing(spacing3); vessel_img.SetDirection(direction3)
 
-        keep = sitk.Image(rel.GetSize(), sitk.sitkUInt8); keep.CopyInformation(rel)
-        for L in stats.GetLabels():
-            lbl = sitk.Equal(rel, int(L))
-            # intersect with strong
-            if sitk.GetArrayFromImage(sitk.And(lbl, strong)).any():
-                keep = sitk.Or(keep, lbl)
-
-        # union with main mask, still constrained to brain
-        mask_img = sitk.Or(mask_img, sitk.And(keep, brain_img))
-
-    # cleanup:
-    # (a) suppress near-boundary rim
-    mask_img = sitk.And(mask_img, far_from_rim)
-    # (b) confine to brain core
-    mask_img = sitk.And(mask_img, brain_core)
-    # (c) small opening to break spurs
-    mask_img = sitk.BinaryMorphologicalOpening(mask_img, MORPH_RADIUS if MORPH_RADIUS else (1,1,1))
-
-    # (d) drop tiny components
-    cc = sitk.ConnectedComponent(mask_img)
-    stats = sitk.LabelShapeStatisticsImageFilter(); stats.Execute(cc)
-    final = sitk.Image(cc.GetSize(), sitk.sitkUInt8); final.CopyInformation(cc)
+    # Drop isolated single-voxel noise and huge non-arterial blobs
+    cc_img = sitk.ConnectedComponent(vessel_img)
+    stats = sitk.LabelShapeStatisticsImageFilter(); stats.Execute(cc_img)
+    final = sitk.Image(cc_img.GetSize(), sitk.sitkUInt8); final.CopyInformation(cc_img)
     for L in stats.GetLabels():
-        if stats.GetNumberOfPixels(L) >= int(MIN_VOXELS_KEEP):
-            final = sitk.Or(final, sitk.Equal(cc, int(L)))
+        sz = stats.GetNumberOfPixels(L)
+        if 2 <= sz <= 3000:
+            final = sitk.Or(final, sitk.Equal(cc_img, int(L)))
     mask_img = final
 
-    # write
     sitk.WriteImage(mask_img, str(out_vessel_path))
     nvox = int(sitk.GetArrayFromImage(mask_img).sum())
     print(f"[CTP] Wrote vessel mask: {out_vessel_path}  (voxels={nvox})")

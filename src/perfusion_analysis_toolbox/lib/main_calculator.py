@@ -2,13 +2,12 @@
 
 import argparse
 import logging
+import os
 
 import itk
 import numpy as np
 import numpy.typing as npt
 import torch
-import os
-
 
 from . import utils
 from .ParamsCalculator import ctc as ctc
@@ -19,7 +18,14 @@ from .ParamsCalculator import mtt as mtt
 
 
 class MainCalculator:
-    """Main calculator."""
+    """
+    Main perfusion calculator.
+
+    This class assumes:
+    - raw_perf is a 4D numpy array (Z, Y, X, T)
+    - mask and vessels are 3D numpy arrays (Z, Y, X)
+    - Metadata is copied from reference images at write-time
+    """
 
     def __init__(
         self,
@@ -36,111 +42,134 @@ class MainCalculator:
     ):
         if raw_perf.ndim != 4:
             raise ValueError(
-                "Expected input numpy array or torch tensor"
-                "of size (slice, row, column, time)"
+                "Expected raw_perf of shape (Z, Y, X, T)"
             )
 
         self.logger = (
             logger
             if logger
-            else utils.get_logger("MainCalculator", level=logging.DEBUG)
+            else utils.get_logger("MainCalculator", level=logging.INFO)
         )
-        self.logger.info(f"Sending the raw perfusion image to '{device}'")
 
-        # Use float32 (fixes ITK int wrapping issues and is better numerically)
+        self.logger.info(f"Sending raw perfusion image to '{device}'")
+
+        # Store arrays
         self.raw_perf = raw_perf.astype(np.float32)
+        self.mask = mask.astype(bool)
+        self.vessels = vessels.astype(bool)
 
-        self.spacing = spacing
-        self.config = config
-        self.itkinfo = [origin, spacing, direction, save_path]
-        self.device = device
-
-        self.nS = self.raw_perf.shape[0]
-        self.nR = self.raw_perf.shape[1]
-        self.nC = self.raw_perf.shape[2]
-        self.nT = self.raw_perf.shape[3]
+        # Shapes
+        self.nS, self.nR, self.nC, self.nT = self.raw_perf.shape
         self.size = [self.nS, self.nR, self.nC, self.nT]
 
-        self.mask = mask
+        # Config + paths
+        self.config = config
         self.savepath = save_path
-        self.vessels = vessels
+        self.device = device
 
-        # ---------- NEW: build CTA proxy + attach registration info ----------
-        # Use temporal mean of perfusion as a pseudo-CTA volume (S,R,C)
-        cta_np = self.raw_perf.mean(axis=3)  # (z, y, x)
+        # Store reference file paths (CRITICAL)
+        self.image_path = config.image_path
+        self.mask_path = config.mask_path
 
-        # Only set these if they weren't already set on config
-        if not hasattr(self.config, "cta_np"):
-            self.config.cta_np = cta_np
+        os.makedirs(self.savepath, exist_ok=True)
 
-        if not hasattr(self.config, "fixed_image_path"):
-            self.config.fixed_image_path = (
-                "/home/sasaigoli/Documents/Data/reoriented_ccw.nii.gz"
-            )
-        # ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Internal helper: safe write using metadata copy
+    # ------------------------------------------------------------------
+    def _write_like(self, arr: np.ndarray, ref_img: itk.Image, out_path: str):
+        """
+        Write numpy array as NIfTI, copying metadata from ref_img.
+        This avoids all ITK Python type issues.
+        """
+        img = itk.image_view_from_array(arr.astype(np.float32))
+        img.CopyInformation(ref_img)
+        itk.imwrite(img, out_path)
 
-
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
     def run(self):
         self.main_cal()
 
+    # ------------------------------------------------------------------
+    # Main computation
+    # ------------------------------------------------------------------
     def main_cal(self):
         print("\n[MAIN] Starting perfusion pipeline...")
-        os.makedirs(self.savepath, exist_ok=True)
 
-        mask = self.mask
-        vessels = self.vessels
+        # Load reference images
+        ref_3d = itk.imread(self.mask_path)
+        ref_4d = itk.imread(self.image_path)
 
-        # ============================
-        # CUDA CHECK BEFORE PIPELINE
-        # ============================
-        import torch
+        # Step 1: CTC from raw signal
+        print("[MAIN] Computing CTC / bolus timing...")
+        CTC, BOLUS = ctc.DSC_conc(self.raw_perf, self.mask.copy())
 
-        def check_cuda_or_warn():
-            if torch.cuda.is_available():
-                print("[SYSTEM] CUDA detected — GPU acceleration ENABLED.")
-                return True
-            else:
-                print("\n[WARNING] CUDA GPU NOT AVAILABLE.")
-                print("The pipeline will run on CPU, which may be significantly slower.")
-                answer = input("Proceed with CPU? (y/n): ").strip().lower()
-                if answer != "y":
-                    raise RuntimeError("Execution cancelled — no CUDA device.")
-                print("[SYSTEM] Running in CPU mode...")
-                return False
-       
-        check_cuda_or_warn()
+        # Strip CTA artifact by truncating the time series at the onset frame.
+        # Hard-zeroing the CTA frames creates a discontinuity that wraps around
+        # inside the circulant deconvolution matrix, producing spurious late
+        # residue peaks (Tmax ~55s) for every voxel. Truncating eliminates
+        # those zero frames entirely so the signal remains continuous.
+        cta_start = ctc.detect_cta_artifact(CTC, self.mask)
+        if cta_start < CTC.shape[-1]:
+            CTC   = CTC[..., :cta_start]
+            BOLUS = np.minimum(BOLUS, cta_start - 1)
+            print(f"[MAIN] CTA artifact: truncated to {cta_start} frames "
+                  f"(dropped {self.nT - cta_start})")
 
-        print("[MAIN] Computing CTC/BOLUS...")
-        CTC, BOLUS = ctc.DSC_conc(self.raw_perf, mask.copy())
-
+        # Step 2: AIF from UNSMOOTHED CTC
         print("[MAIN] Computing AIF...")
         AIF = aif.DSC_aif(
-            mask.copy(),
-            CTC,
-            BOLUS,
-            self.size,
-            self.config,
-            self.device,
-            vessels,
-            self.savepath,
-            cta_np=getattr(self.config, "cta_np", None),
-            fixed_image_path=getattr(self.config, "fixed_image_path", None),
+            self.mask.copy(), CTC, BOLUS,
+            self.size, self.config, self.device,
+            self.vessels, self.savepath,
         )
-        print("[MAIN] AIF done.")
+        print("[MAIN] AIF complete.")
 
+        # Step 3: Smooth CTC for deconvolution (AFTER AIF).
+        # Apply only in-plane (axes 1 and 2); axis 0 is Z (4mm slices) where
+        # cross-slice blur would destroy ischemic contrast.
+        # 4mm FWHM at 0.391mm/px ≈ sigma=4.3px — necessary at this fine resolution
+        # to suppress Poisson noise enough for stable oSVD deconvolution.
+        from scipy.ndimage import gaussian_filter
+        voxel_size_mm = 0.391
+        fwhm_mm = 4.0
+        sigma = (fwhm_mm / voxel_size_mm) / 2.355
+        CTC_smooth = np.zeros_like(CTC)
+        for t in range(CTC.shape[-1]):
+            vol = CTC[..., t].copy().astype(float)
+            vol[~self.mask] = 0.0
+            smoothed = gaussian_filter(vol, sigma=[0, sigma, sigma])
+            smoothed[~self.mask] = 0.0
+            CTC_smooth[..., t] = smoothed
+        CTC = CTC_smooth
+
+        # Step 4: Compute maps from smoothed CTC
         print("[MAIN] Computing CBV...")
-        CBV = cbv.cal(mask.copy(), CTC, AIF, self.config, self.device)
+        CBV = cbv.cal(self.mask.copy(), CTC, AIF, self.config, self.device)
 
-        print("[MAIN] Computing CBF/TMAX...")
-        CBF, TMAX = cbf.cal(CTC, AIF, mask.copy())
+        print("[MAIN] Computing CBF / Tmax...")
+        CBF, TMAX = cbf.cal(
+            CTC, AIF, self.mask.copy(),
+            svd_frac=float(self.config.svd_frac),
+            max_delay_s=float(self.config.max_delay_s),
+        )
 
         print("[MAIN] Computing MTT...")
-        MTT = mtt.cal(CBV, CBF, mask.copy())
+        MTT = mtt.cal(CBV, CBF, self.mask.copy())
 
-        print("[MAIN] Writing NIFTI outputs to:", self.savepath)
-        itk.imwrite(itk.image_view_from_array(MTT), f"{self.savepath}/mtt.nii.gz")
-        itk.imwrite(itk.image_view_from_array(CBV), f"{self.savepath}/cbv.nii.gz")
-        itk.imwrite(itk.image_view_from_array(CBF), f"{self.savepath}/cbf.nii.gz")
-        itk.imwrite(itk.image_view_from_array(CTC), f"{self.savepath}/ctc.nii.gz")
+        # Step 5: Write outputs
+        print("[MAIN] Writing NIfTI outputs to:", self.savepath)
+        self._write_like(CBF,  ref_3d, f"{self.savepath}/cbf.nii.gz")
+        self._write_like(CBV,  ref_3d, f"{self.savepath}/cbv.nii.gz")
+        self._write_like(MTT,  ref_3d, f"{self.savepath}/mtt.nii.gz")
+        # TMAX from oSVD is already in seconds; no further TR multiplication needed
+        self._write_like(TMAX.astype(np.float32), ref_3d, f"{self.savepath}/tmax.nii.gz")
+        # CTC may be shorter than ref_4d after CTA truncation — write without metadata
+        try:
+            self._write_like(CTC, ref_4d, f"{self.savepath}/ctc.nii.gz")
+        except Exception:
+            ctc_img = itk.image_view_from_array(CTC.astype(np.float32))
+            itk.imwrite(ctc_img, f"{self.savepath}/ctc.nii.gz")
 
         print("[MAIN] Pipeline complete.\n")
