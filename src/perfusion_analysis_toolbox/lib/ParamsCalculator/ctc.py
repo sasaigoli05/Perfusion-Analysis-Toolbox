@@ -1,5 +1,24 @@
 import numpy as np
 
+from scipy.ndimage import gaussian_filter
+
+def smooth_ctc(conc, mask, fwhm_vox=2.0):
+    """
+    Apply spatial Gaussian smoothing to CTC within the brain mask.
+    fwhm_vox: FWHM in voxels (typically 4-6mm / voxel_size_mm)
+    """
+    sigma = fwhm_vox / 2.355  # convert FWHM to sigma
+    conc_smooth = np.zeros_like(conc)
+    nT = conc.shape[-1]
+    for t in range(nT):
+        vol = conc[..., t].copy()
+        vol[~mask] = 0.0
+        smoothed = gaussian_filter(vol.astype(float), sigma=sigma)
+        # Re-apply mask to avoid blurring signal into non-brain
+        smoothed[~mask] = 0.0
+        conc_smooth[..., t] = smoothed
+    return conc_smooth
+
 def _match_mask_to_volumes(mask, volumes):
     """
     Ensure mask.shape[:3] == volumes.shape[:3] by nearest-neighbor resizing.
@@ -29,6 +48,57 @@ def _match_mask_to_volumes(mask, volumes):
     else:
         resized = resized.astype(bool)
     return resized
+
+def detect_cta_artifact(ctc, mask):
+    """
+    Detect and return the frame where a late CTA injection artifact begins.
+
+    In combined CTP+CTA protocols, a second contrast bolus is injected for
+    the CTA acquisition. This arrives in the brain as a massive late spike,
+    completely overwhelming the first-pass CTP signal. We detect it by
+    looking for a second large rise in global mean CTC after the first-pass
+    peak has substantially decayed.
+
+    Returns
+    -------
+    cta_start : int
+        Index of first artifact frame, or ctc.shape[-1] if none detected.
+    """
+    n_mask = mask.sum()
+    if n_mask < 10 or ctc.shape[-1] < 10:
+        return ctc.shape[-1]
+
+    # Global mean per frame (masked voxels only)
+    gm = np.array([ctc[mask, t].mean() for t in range(ctc.shape[-1])], dtype=float)
+
+    # Use only the first 50% of frames to find the first-pass peak,
+    # so a late CTA injection (which can be larger than the first pass)
+    # doesn't masquerade as the peak and disable the detection.
+    first_pass_end = max(len(gm) // 2, 5)
+    peak_frame = int(np.argmax(gm[:first_pass_end]))
+
+    # Post-peak reference: mean of 4 frames starting 3 frames after the peak
+    ref_start = min(peak_frame + 3, len(gm) - 4)
+    post_peak_ref = max(gm[ref_start:ref_start + 4].mean(), 1.0)
+
+    # Scan for a second rise that exceeds 3x the post-peak level AND
+    # is larger than the first-pass peak (clearly a second injection).
+    # Once the peak is found, backtrack to catch the leading edge of the
+    # artifact rise (the onset where gm first exceeds 1.5x post-peak ref).
+    search_from = peak_frame + 5
+    for t in range(search_from, len(gm)):
+        if gm[t] > 3.0 * post_peak_ref and gm[t] > 0.5 * gm[peak_frame]:
+            # Walk backwards to find where the rise started
+            onset = t
+            while onset > search_from and gm[onset - 1] > 1.5 * post_peak_ref:
+                onset -= 1
+            print(f"[CTC] CTA artifact detected at frame {t} "
+                  f"(global mean {gm[t]:.1f} vs post-peak ref {post_peak_ref:.1f}). "
+                  f"Zeroing from onset frame {onset}.")
+            return onset
+
+    return ctc.shape[-1]
+
 
 def DSC_conc(volumes, mask):
     # Make shapes compatible first
