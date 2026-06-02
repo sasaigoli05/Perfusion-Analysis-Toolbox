@@ -94,12 +94,68 @@ class MainCalculator:
     # ------------------------------------------------------------------
     # Main computation
     # ------------------------------------------------------------------
+    @staticmethod
+    def _motion_correct(raw_perf: np.ndarray) -> np.ndarray:
+        """
+        Rigid motion correction: register each 3D volume to volume 0.
+        Uses SimpleITK Euler3D (6-DOF rigid) with mean-squares metric.
+        Fast single-resolution registration — CTP motion is typically <3mm.
+        """
+        import SimpleITK as sitk
+
+        nZ, nY, nX, nT = raw_perf.shape
+        fixed_np   = raw_perf[..., 0].astype(np.float32)
+        fixed_sitk = sitk.GetImageFromArray(fixed_np)
+        corrected  = raw_perf.copy()
+
+        reg = sitk.ImageRegistrationMethod()
+        reg.SetMetricAsMeanSquares()
+        reg.SetMetricSamplingStrategy(reg.RANDOM)
+        reg.SetMetricSamplingPercentage(0.15)
+        reg.SetInterpolator(sitk.sitkLinear)
+        reg.SetOptimizerAsGradientDescentLineSearch(
+            learningRate=1.0, numberOfIterations=50,
+            convergenceMinimumValue=1e-5, convergenceWindowSize=5,
+        )
+        reg.SetOptimizerScalesFromPhysicalShift()
+
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(fixed_sitk)
+        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetDefaultPixelValue(0.0)
+
+        n_moved = 0
+        for t in range(1, nT):
+            moving_sitk = sitk.GetImageFromArray(raw_perf[..., t].astype(np.float32))
+            init_tx = sitk.CenteredTransformInitializer(
+                fixed_sitk, moving_sitk, sitk.Euler3DTransform(),
+                sitk.CenteredTransformInitializerFilter.GEOMETRY,
+            )
+            reg.SetInitialTransform(init_tx, inPlace=False)
+            tx = reg.Execute(fixed_sitk, moving_sitk)
+            # Skip if transform is essentially identity (saves write time)
+            params = np.array(tx.GetParameters())
+            if np.abs(params).max() > 1e-4:
+                resampler.SetTransform(tx)
+                corrected[..., t] = sitk.GetArrayFromImage(
+                    resampler.Execute(moving_sitk)
+                )
+                n_moved += 1
+
+        print(f"[MOCO] {n_moved}/{nT-1} volumes had non-trivial motion")
+        return corrected
+
     def main_cal(self):
         print("\n[MAIN] Starting perfusion pipeline...")
 
         # Load reference images
         ref_3d = itk.imread(self.mask_path)
         ref_4d = itk.imread(self.image_path)
+
+        # Step 0: Motion correction (PyPeT-style, EXPERIMENT).
+        # To revert: remove the next two lines.
+        print("[MAIN] Motion correction...")
+        self.raw_perf = self._motion_correct(self.raw_perf)
 
         # Step 1: CTC from raw signal
         print("[MAIN] Computing CTC / bolus timing...")
