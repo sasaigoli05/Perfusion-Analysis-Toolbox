@@ -8,6 +8,7 @@ import itk
 import numpy as np
 import numpy.typing as npt
 import torch
+from scipy.ndimage import gaussian_filter
 
 from . import utils
 from .ParamsCalculator import ctc as ctc
@@ -117,7 +118,22 @@ class MainCalculator:
             print(f"[MAIN] CTA artifact: truncated to {cta_start} frames "
                   f"(dropped {self.nT - cta_start})")
 
-        # Step 2: AIF from UNSMOOTHED CTC
+        # Step 2: 1mm spatial pre-smooth BEFORE AIF extraction (PyPeT approach).
+        # PyPeT smooths the full volume first so that AIF and tissue CTC are
+        # drawn from the same signal.  Previous approach smoothed after AIF.
+        # EXPERIMENT (experiment/pypet-aif): swap these two blocks to revert.
+        voxel_size_mm = 0.391
+        pre_sigma = (1.0 / voxel_size_mm) / 2.355
+        CTC_smooth = np.zeros_like(CTC)
+        for t in range(CTC.shape[-1]):
+            vol = CTC[..., t].copy().astype(float)
+            vol[~self.mask] = 0.0
+            smoothed = gaussian_filter(vol, sigma=[0, pre_sigma, pre_sigma])
+            smoothed[~self.mask] = 0.0
+            CTC_smooth[..., t] = smoothed
+        CTC = CTC_smooth
+
+        # Step 3: AIF from smoothed CTC
         print("[MAIN] Computing AIF...")
         AIF = aif.DSC_aif(
             self.mask.copy(), CTC, BOLUS,
@@ -126,25 +142,17 @@ class MainCalculator:
         )
         print("[MAIN] AIF complete.")
 
-        # Step 3: Smooth CTC for deconvolution (AFTER AIF).
-        # Apply only in-plane (axes 1 and 2); axis 0 is Z (4mm slices) where
-        # cross-slice blur would destroy ischemic contrast.
-        # 4mm FWHM at 0.391mm/px ≈ sigma=4.3px — necessary at this fine resolution
-        # to suppress Poisson noise enough for stable oSVD deconvolution.
-        from scipy.ndimage import gaussian_filter
-        voxel_size_mm = 0.391
-        fwhm_mm = 4.0
-        sigma = (fwhm_mm / voxel_size_mm) / 2.355
-        CTC_smooth = np.zeros_like(CTC)
-        for t in range(CTC.shape[-1]):
-            vol = CTC[..., t].copy().astype(float)
-            vol[~self.mask] = 0.0
-            smoothed = gaussian_filter(vol, sigma=[0, sigma, sigma])
-            smoothed[~self.mask] = 0.0
-            CTC_smooth[..., t] = smoothed
-        CTC = CTC_smooth
+        # No-signal mask from smoothed CTC peak.
+        aif_peak = float(np.max(AIF["gv"]))
+        ctc_peak_map = CTC.max(axis=-1)
+        threshold = float(np.percentile(ctc_peak_map[self.mask], 15))
+        no_signal = self.mask & (ctc_peak_map < threshold)
+        print(f"[MAIN] No-signal mask: AIF_peak={aif_peak:.1f}  "
+              f"p15_threshold={threshold:.1f}  "
+              f"{no_signal.sum()} voxels zeroed "
+              f"({no_signal[self.mask].mean()*100:.1f}% of brain)")
 
-        # Step 4: Compute maps from smoothed CTC
+        # Step 5: Deconvolution on lightly-smoothed CTC.
         print("[MAIN] Computing CBV...")
         CBV = cbv.cal(self.mask.copy(), CTC, AIF, self.config, self.device)
 
@@ -155,10 +163,14 @@ class MainCalculator:
             max_delay_s=float(self.config.max_delay_s),
         )
 
+        # Zero no-signal (core) voxels.
+        CBF[no_signal]  = 0.0
+        TMAX[no_signal] = 0.0
+
         print("[MAIN] Computing MTT...")
         MTT = mtt.cal(CBV, CBF, self.mask.copy())
 
-        # Step 5: Write outputs
+        # Step 6: Write outputs
         print("[MAIN] Writing NIfTI outputs to:", self.savepath)
         self._write_like(CBF,  ref_3d, f"{self.savepath}/cbf.nii.gz")
         self._write_like(CBV,  ref_3d, f"{self.savepath}/cbv.nii.gz")
