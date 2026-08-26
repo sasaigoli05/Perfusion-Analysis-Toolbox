@@ -6,9 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "perfusion-analysis-toolbox"
 description = "Tools for computing perfusion parameters over CT images"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
-    "Programming Language :: Python :: 3"
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
 ]
 dynamic = ["version", "readme"]
 
@@ -17,7 +18,7 @@ dependencies = [
   'matplotlib',
   'numpy',
   'scipy',
-  'tensorboardX',
+  'SimpleITK',
   'torch',
 ]
 
@@ -41,7 +42,7 @@ readme = {file = ["README.md"]}
 
 [tool.black]
 line-length = 79
-target_version = ['py38']
+target_version = ['py310']
 exclude = '''
 
 (

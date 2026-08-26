@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-# preprocess.py — DICOM dir -> NIfTI (dcm2niix) -> brain mask (skull-free, eroded) -> vessel mask (peak-pre with rim suppression + SITK hysteresis-like enhancement)
+"""
+preprocess.py — DICOM → NIfTI (dcm2niix) → brain mask (skull-free, eroded) → vessel mask
+"""
 from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
 import subprocess, shutil, time
 import numpy as np
-import SimpleITK as sitk
+
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk = None
+import itk
 
 # =============================
-# Tunables / Parameters
+# Tunables
 # =============================
-THRESH_MODE       = "otsu"   # "otsu" or "fixed"
-FIXED_THRESH_VAL  = 30       # used only if THRESH_MODE == "fixed" (0..255)
-MIN_PRE_FRAMES    = 3
-K_STD             = 2.0
-MORPH_RADIUS      = (1, 1, 1)   # for small openings/closings
-KEEP_LARGEST_CC   = True
-ERODE_BRAIN_VOX   = 2          # pull brain mask away from skull (voxels)
-RIM_DISTANCE_MM   = 2.0        # suppress detections within this distance to brain boundary
-MIN_VOXELS_KEEP   = 50         # drop tiny vessel blobs (< this many voxels)
-SOFT_TISSUE_RANGE = (-20, 80)  # HU-ish range used to strip bone on baseline volume
+MIN_PRE_FRAMES = 3
+K_STD = 2.0
+MORPH_RADIUS = (1, 1, 1)
+KEEP_LARGEST_CC = True
+ERODE_BRAIN_VOX = 2
+SOFT_TISSUE_RANGE = (-20, 80)
 # =============================
 
 
-# ---------- Helpers ----------
 def _run_dcm2niix(dicom_dir: Path, out_dir: Path, tag: str) -> Path:
     exe = shutil.which("dcm2niix")
     if not exe:
@@ -32,11 +34,26 @@ def _run_dcm2niix(dicom_dir: Path, out_dir: Path, tag: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     base = f"image_{tag}"
 
-    cmd = [exe, "-z", "y", "-o", str(out_dir), "-f", base, "-b", "n", "-v", "1", str(dicom_dir)]
+    cmd = [
+        exe,
+        "-z",
+        "y",
+        "-o",
+        str(out_dir),
+        "-f",
+        base,
+        "-b",
+        "n",
+        "-v",
+        "1",
+        str(dicom_dir),
+    ]
     print(f"[INFO] Running: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.stdout: print(proc.stdout.strip())
-    if proc.stderr: print(proc.stderr.strip())
+    if proc.stdout:
+        print(proc.stdout.strip())
+    if proc.stderr:
+        print(proc.stderr.strip())
     if proc.returncode != 0:
         raise RuntimeError(f"dcm2niix failed ({proc.returncode}).")
 
@@ -48,8 +65,10 @@ def _run_dcm2niix(dicom_dir: Path, out_dir: Path, tag: str) -> Path:
     return nii_path
 
 
-def _extract_3d_geometry(img: sitk.Image):
-    origin = img.GetOrigin(); spacing = img.GetSpacing(); direction = img.GetDirection()
+def _extract_3d_geometry(img):
+    origin = img.GetOrigin()
+    spacing = img.GetSpacing()
+    direction = img.GetDirection()
     origin3 = tuple(origin[:3]) if len(origin) >= 3 else (0.0, 0.0, 0.0)
     spacing3 = tuple(spacing[:3]) if len(spacing) >= 3 else (1.0, 1.0, 1.0)
     dir_vals = np.array(direction, dtype=float)
@@ -58,7 +77,7 @@ def _extract_3d_geometry(img: sitk.Image):
     elif dir_vals.size == 9:
         direction3 = tuple(dir_vals)
     else:
-        direction3 = (1,0,0, 0,1,0, 0,0,1)
+        direction3 = (1, 0, 0, 0, 1, 0, 0, 0, 1)
     return origin3, spacing3, direction3
 
 
@@ -69,14 +88,16 @@ def _find_pre_and_ttp(arr4d: np.ndarray, mask: np.ndarray) -> tuple[int, int]:
 
     TTP search is restricted to the first 50% of frames so that a late
     CTA second-injection (combined CTP+CTA protocols) cannot be mistaken
-    for the first-pass bolus peak. Without this guard the vessel mask ends
-    up labelling venous sinuses that fill during the CTA phase, not the
-    cerebral arteries that fill during the CTP first pass.
+    for the first-pass bolus peak.
     """
     T = arr4d.shape[0]
-    mean_t = np.array([arr4d[t][mask].mean() if mask.any() else arr4d[t].mean() for t in range(T)])
+    mean_t = np.array(
+        [
+            arr4d[t][mask].mean() if mask.any() else arr4d[t].mean()
+            for t in range(T)
+        ]
+    )
 
-    # Restrict to first half to avoid CTA injection artifact
     first_pass_end = max(T // 2, min(5, T - 1))
     ttp = int(np.argmax(mean_t[:first_pass_end]))
 
@@ -84,186 +105,159 @@ def _find_pre_and_ttp(arr4d: np.ndarray, mask: np.ndarray) -> tuple[int, int]:
         pre = max(0, ttp - 1)
     else:
         base_end = max(MIN_PRE_FRAMES, ttp // 3)
-        base_mean, base_std = mean_t[:base_end].mean(), mean_t[:base_end].std() + 1e-6
-        pre_candidates = np.where(mean_t[:ttp] <= base_mean + K_STD * base_std)[0]
-        pre = int(pre_candidates[-1]) if pre_candidates.size else max(0, ttp - 1)
-    print(f"[CTP] T={T} | first-pass TTP={ttp} (searched frames 0–{first_pass_end-1}) | pre={pre}")
-    print(f"[Curve] mean_t min/max: {mean_t.min():.1f}/{mean_t.max():.1f}")
+        base_mean, base_std = (
+            mean_t[:base_end].mean(),
+            mean_t[:base_end].std() + 1e-6,
+        )
+        pre_candidates = np.where(
+            mean_t[:ttp] <= base_mean + K_STD * base_std
+        )[0]
+        pre = (
+            int(pre_candidates[-1]) if pre_candidates.size else max(0, ttp - 1)
+        )
+    print(
+        f"[CTP] T={T} | first-pass TTP={ttp} (searched frames 0–{first_pass_end-1}) | pre={pre}"
+    )
     return pre, ttp
 
 
 # ---------- Brain mask (skull-free + eroded) ----------
 def _make_brain_mask(nii_path: Path, out_mask_path: Path) -> Path:
+    if sitk is None:
+        raise ImportError(
+            "SimpleITK is required for brain masking. pip install SimpleITK"
+        )
     img = sitk.ReadImage(str(nii_path), sitk.sitkFloat32)
     arr = sitk.GetArrayFromImage(img)  # (T,Z,Y,X) or (Z,Y,X)
     origin3, spacing3, direction3 = _extract_3d_geometry(img)
 
-    # choose baseline 3D volume (median up to pre)
     if arr.ndim == 4:
         T = arr.shape[0]
-        # crude auto-mask for curve estimation
         m0 = (arr != 0).sum(axis=0) >= (0.5 * T)
         pre, _ = _find_pre_and_ttp(arr, m0)
-        base_arr = np.median(arr[:max(1, pre+1)], axis=0).astype(np.float32)
+        base_arr = np.median(arr[: max(1, pre + 1)], axis=0).astype(np.float32)
     else:
         base_arr = arr.astype(np.float32)
 
     base = sitk.GetImageFromArray(base_arr)
-    base.SetOrigin(origin3); base.SetSpacing(spacing3); base.SetDirection(direction3)
+    base.SetOrigin(origin3)
+    base.SetSpacing(spacing3)
+    base.SetDirection(direction3)
 
-    # skull strip via soft-tissue window (remove bone)
     low, high = SOFT_TISSUE_RANGE
-    soft = sitk.BinaryThreshold(base, lowerThreshold=float(low), upperThreshold=float(high), insideValue=1, outsideValue=0)
-
-    # morphology: close holes, keep largest CC
-    soft = sitk.BinaryMorphologicalClosing(soft, MORPH_RADIUS if MORPH_RADIUS else (1,1,1))
-    cc   = sitk.ConnectedComponent(soft)
+    soft = sitk.BinaryThreshold(
+        base,
+        lowerThreshold=float(low),
+        upperThreshold=float(high),
+        insideValue=1,
+        outsideValue=0,
+    )
+    soft = sitk.BinaryMorphologicalClosing(
+        soft, MORPH_RADIUS if MORPH_RADIUS else (1, 1, 1)
+    )
+    cc = sitk.ConnectedComponent(soft)
     soft = sitk.RelabelComponent(cc, sortByObjectSize=True)
-    soft = sitk.BinaryThreshold(soft, 1, 1, 1, 0)  # largest only
-
-    # erode inward to avoid skull rim in (peak-pre)
-    brain_mask = sitk.BinaryErode(soft, (int(ERODE_BRAIN_VOX),)*3)
+    soft = sitk.BinaryThreshold(soft, 1, 1, 1, 0)
+    brain_mask = sitk.BinaryErode(soft, (int(ERODE_BRAIN_VOX),) * 3)
 
     sitk.WriteImage(brain_mask, str(out_mask_path))
     print(f"[OK] Brain mask saved: {out_mask_path}")
     return out_mask_path
 
 
-# ---------- Vessel mask (first-pass peak + bolus width scoring) ----------
-def _make_vessel_mask(
-    nii_path: Path,
-    brain_mask_path: Path,
-    out_vessel_path: Path,
-    THRESH_MODE: str = THRESH_MODE,
-    FIXED_THRESH: int = FIXED_THRESH_VAL
-) -> Path:
-    """
-    Build a vessel mask using first-pass peak and bolus width scoring.
+# ---------- Vessel mask (first-pass peak + bolus-width scoring) ----------
+def _vessel_mask_numpy(arr4d, brain_arr, pre, first_pass_end):
+    from scipy.ndimage import label as cc_label
 
-    Replaces the old single-frame peak-minus-baseline + Otsu approach.
-    Key improvements:
-      - Peak is the max over first-pass frames only (CTA spike excluded)
-      - Bolus width (FWHM in first-pass window) penalises wide parenchymal curves
-      - Adaptive threshold (top 2% by score AND > 2× parenchymal median)
-      - Rim suppression and spatial cleanup retained from previous version
-    """
+    Z, Y, X = brain_arr.shape
+    baseline = arr4d[: max(1, pre + 1)].mean(axis=0)
+    fp_ctc = np.clip(arr4d[:first_pass_end] - baseline, 0, None)
+    fp_peak = fp_ctc.max(axis=0)
+    fp_width = np.maximum(
+        np.sum(fp_ctc > (fp_peak / 2.0)[np.newaxis], axis=0).astype(float), 1.0
+    )
 
-    # load CTP and geometry
-    img4d = sitk.ReadImage(str(nii_path), sitk.sitkFloat32)
-    arr4d = sitk.GetArrayFromImage(img4d)   # (T, Z, Y, X)
-    if arr4d.ndim != 4:
-        raise ValueError(f"Expected 4D image, got shape {arr4d.shape}")
-    T, Z, Y, X = arr4d.shape
-
-    origin3 = tuple(img4d.GetOrigin()[:3])
-    spacing3 = tuple(img4d.GetSpacing()[:3])
-    dir_flat = img4d.GetDirection()
-    if len(dir_flat) >= 9:
-        n = int(round(len(dir_flat) ** 0.5))
-        direction3 = tuple(np.array(dir_flat).reshape(n, n)[:3, :3].ravel())
-    else:
-        direction3 = tuple(dir_flat)
-
-    # read brain mask
-    if not (brain_mask_path and Path(brain_mask_path).exists()):
-        raise FileNotFoundError("Brain mask not found. Run _make_brain_mask first.")
-    brain_img = sitk.ReadImage(str(brain_mask_path), sitk.sitkUInt8)
-    brain_arr = sitk.GetArrayFromImage(brain_img).astype(bool)
-    if brain_arr.shape != (Z, Y, X):
-        raise ValueError(f"Mask shape {brain_arr.shape} != CTP spatial {(Z,Y,X)}")
-
-    # timepoints — TTP restricted to first half to exclude CTA injection
-    pre, ttp = _find_pre_and_ttp(arr4d, brain_arr)
-    first_pass_end = max(T // 2, min(5, T - 1))
-
-    # Per-voxel first-pass enhancement: subtract baseline, clip to >= 0
-    baseline = arr4d[:max(1, pre + 1)].mean(axis=0)       # (Z, Y, X)
-    fp_ctc = np.clip(arr4d[:first_pass_end] - baseline, 0, None)  # (T_fp, Z, Y, X)
-
-    fp_peak  = fp_ctc.max(axis=0)                          # (Z, Y, X)
-    half_peak = fp_peak / 2.0
-    fp_width  = np.sum(fp_ctc > half_peak[np.newaxis, ...], axis=0).astype(float)
-    fp_width  = np.maximum(fp_width, 1.0)
-
-    # Score within brain mask only
     zz, rr, cc = np.where(brain_arr)
-    peaks  = fp_peak[zz, rr, cc]
+    peaks = fp_peak[zz, rr, cc]
     widths = fp_width[zz, rr, cc]
-
-    pos_peaks = peaks[peaks > 0]
-    if len(pos_peaks) < 10:
-        print("[VESSEL] Too few positive-peak brain voxels — falling back to empty mask")
-        sitk.WriteImage(sitk.Image(X, Y, Z, sitk.sitkUInt8), str(out_vessel_path))
-        return out_vessel_path
-    peak_median = float(np.median(pos_peaks))
-    min_peak = 2.0 * peak_median
+    pos = peaks[peaks > 0]
+    if len(pos) < 10:
+        return np.zeros((Z, Y, X), dtype=np.uint8)
 
     def _norm01(x):
         r = x.max() - x.min()
         return (x - x.min()) / r if r > 1e-9 else np.zeros_like(x)
 
     score = _norm01(peaks) - 0.5 * _norm01(widths)
-
-    threshold_score = np.percentile(score, 98)
-    selected = (score >= threshold_score) & (peaks >= min_peak)
+    selected = (score >= np.percentile(score, 98)) & (
+        peaks >= 2.0 * float(np.median(pos))
+    )
 
     score_map = np.zeros((Z, Y, X), dtype=np.float32)
     score_map[zz[selected], rr[selected], cc[selected]] = score[selected]
+    vessel_bin = (score_map > 0).astype(np.uint8)
 
-    pr = np.percentile(fp_peak[brain_arr], [90, 95, 98, 99])
-    print(f"[VESSEL] First-pass peak percentiles (brain) "
-          f"90:{pr[0]:.1f} 95:{pr[1]:.1f} 98:{pr[2]:.1f} 99:{pr[3]:.1f} "
-          f"| min_peak={min_peak:.1f} | candidates={int(selected.sum())}")
+    labeled, _ = cc_label(vessel_bin)
+    counts = np.bincount(labeled.ravel())
+    keep = np.where((counts >= 2) & (counts <= 3000))[0]
+    return np.isin(labeled, keep).astype(np.uint8)
 
-    # Build binary mask from score map — no rim suppression needed because skull
-    # voxels have near-zero first-pass enhancement and are excluded by min_peak.
-    vessel_arr = (score_map > 0).astype(np.uint8)
-    vessel_img = sitk.GetImageFromArray(vessel_arr)
-    vessel_img.SetOrigin(origin3); vessel_img.SetSpacing(spacing3); vessel_img.SetDirection(direction3)
 
-    # Drop isolated single-voxel noise and huge non-arterial blobs
-    cc_img = sitk.ConnectedComponent(vessel_img)
-    stats = sitk.LabelShapeStatisticsImageFilter(); stats.Execute(cc_img)
-    final = sitk.Image(cc_img.GetSize(), sitk.sitkUInt8); final.CopyInformation(cc_img)
-    for L in stats.GetLabels():
-        sz = stats.GetNumberOfPixels(L)
-        if 2 <= sz <= 3000:
-            final = sitk.Or(final, sitk.Equal(cc_img, int(L)))
-    mask_img = final
+def _make_vessel_mask(
+    nii_path: Path,
+    brain_mask_path: Path,
+    out_vessel_path: Path,
+) -> Path:
+    """Score voxels by first-pass peak / bolus-width ratio to identify arterial candidates."""
+    img4d = itk.imread(str(nii_path), itk.F)
+    arr4d = itk.GetArrayFromImage(img4d).astype(np.float32)  # (T, Z, Y, X)
+    del img4d
+    if arr4d.ndim != 4:
+        raise ValueError(f"Expected 4D NIfTI, got shape {arr4d.shape}")
+    T, Z, Y, X = arr4d.shape
 
-    sitk.WriteImage(mask_img, str(out_vessel_path))
-    nvox = int(sitk.GetArrayFromImage(mask_img).sum())
-    print(f"[CTP] Wrote vessel mask: {out_vessel_path}  (voxels={nvox})")
+    brain_img = itk.imread(str(brain_mask_path))
+    brain_arr = itk.GetArrayFromImage(brain_img).astype(bool)  # (Z, Y, X)
+    if brain_arr.shape != (Z, Y, X):
+        raise ValueError(
+            f"Mask shape {brain_arr.shape} != CTP spatial {(Z, Y, X)}"
+        )
+
+    pre, _ = _find_pre_and_ttp(arr4d, brain_arr)
+    first_pass_end = max(T // 2, min(5, T - 1))
+    vessel_arr = _vessel_mask_numpy(arr4d, brain_arr, pre, first_pass_end)
+
+    ref_mask = itk.imread(str(brain_mask_path))
+    result_itk = itk.GetImageFromArray(vessel_arr)
+    result_itk.CopyInformation(ref_mask)
+    itk.imwrite(result_itk, str(out_vessel_path))
+    print(
+        f"[CTP] Wrote vessel mask: {out_vessel_path}  (voxels={int(vessel_arr.sum())})"
+    )
     return out_vessel_path
 
 
 # ---------- Orchestrator ----------
-def preprocess_from_dicom(image_directory: str, save_path: str, overwrite: bool = True):
+def preprocess_from_dicom(image_directory: str, save_path: str) -> dict:
     dicom_dir = Path(image_directory).expanduser().resolve()
-    out_dir   = Path(save_path).expanduser().resolve() / "preprocess"
+    out_dir = Path(save_path).expanduser().resolve() / "preprocess"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Step 1: Convert DICOM folder to NIfTI
     nii_path = _run_dcm2niix(dicom_dir, out_dir, ts)
 
-    # Step 2: Brain mask (skull-free + eroded)
     brain_mask_path = out_dir / f"brain_mask_{ts}.nii.gz"
     _make_brain_mask(nii_path, brain_mask_path)
 
-    # Step 3: Vessel mask (peak-pre + rim suppression + hysteresis-like)
     vessel_mask_path = out_dir / f"vessel_mask_{ts}.nii.gz"
     _make_vessel_mask(nii_path, brain_mask_path, vessel_mask_path)
 
-    # --- STOP HERE for inspection ---
-    print("\n✅ Outputs generated. Inspect before pipeline continues:")
+    print("\nOutputs generated:")
     print(f"  NIfTI:        {nii_path}")
     print(f"  Brain mask:   {brain_mask_path}")
     print(f"  Vessel mask:  {vessel_mask_path}")
     print("============================================\n")
-
-    # raise SystemExit(0)  # <-- remove/comment this line when ready to continue
 
     return {
         "image_path": str(nii_path),
@@ -272,10 +266,13 @@ def preprocess_from_dicom(image_directory: str, save_path: str, overwrite: bool 
     }
 
 
-# ---------- CLI (optional) ----------
+# ---------- CLI ----------
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="DICOM -> NIfTI -> brain mask -> vessel mask")
+
+    p = argparse.ArgumentParser(
+        description="DICOM -> NIfTI -> brain mask -> vessel mask"
+    )
     p.add_argument("dicom_dir", help="Path to DICOM directory")
     p.add_argument("save_path", help="Output directory")
     args = p.parse_args()

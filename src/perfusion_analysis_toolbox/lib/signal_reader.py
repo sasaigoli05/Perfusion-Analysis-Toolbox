@@ -11,7 +11,9 @@ def read_signal(
     image_path: str,
     mask_path: str,
     vessel_path: str,
-) -> Tuple[npt.NDArray, npt.NDArray, npt.NDArray, itk.Point, itk.Vector, itk.Matrix]:
+) -> Tuple[
+    npt.NDArray, npt.NDArray, npt.NDArray, itk.Point, itk.Vector, itk.Matrix
+]:
     """
     Load the 4D perfusion image + 3D mask + 3D vessel mask, and make sure
     mask and vessels are in the same (z, y, x) grid as the perfusion.
@@ -36,7 +38,9 @@ def read_signal(
     perf_arr = itk.array_view_from_image(perf_img)  # usually (T, Z, Y, X)
 
     if perf_arr.ndim != 4:
-        raise ValueError(f"Expected 4D perfusion image, got shape {perf_arr.shape}")
+        raise ValueError(
+            f"Expected 4D perfusion image, got shape {perf_arr.shape}"
+        )
 
     # Transpose to (Z, Y, X, T) for MainCalculator
     # ITK (x,y,z,t) -> numpy (t,z,y,x) -> we want (z,y,x,t)
@@ -54,7 +58,7 @@ def read_signal(
     mask_img = itk.imread(mask_path)
     vessel_img = itk.imread(vessel_path)
 
-    mask_arr = itk.array_view_from_image(mask_img)    # (Z, Y, X) or (Y, X) etc.
+    mask_arr = itk.array_view_from_image(mask_img)  # (Z, Y, X) or (Y, X) etc.
     vessel_arr = itk.array_view_from_image(vessel_img)
 
     # Force them to be at least 3D
@@ -79,7 +83,9 @@ def read_signal(
         zf = target[0] / arr.shape[0]
         yf = target[1] / arr.shape[1]
         xf = target[2] / arr.shape[2]
-        print(f"Resampling from {arr.shape} -> {target} with factors (z,y,x)=({zf:.3f},{yf:.3f},{xf:.3f})")
+        print(
+            f"Resampling from {arr.shape} -> {target} with factors (z,y,x)=({zf:.3f},{yf:.3f},{xf:.3f})"
+        )
 
         # order=0 = nearest neighbor (good for masks)
         arr_res = zoom(arr.astype(float), (zf, yf, xf), order=0)

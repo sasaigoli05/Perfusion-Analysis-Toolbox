@@ -5,9 +5,6 @@ Simplified command-line utility to compute perfusion parameters
 using ONLY direct file paths to image, mask, vessel mask, and output.
 """
 
-import torch
-from pathlib import Path
-
 from .lib.utils import datestr
 from .lib.signal_reader import read_signal
 from .lib.main_calculator import MainCalculator
@@ -16,21 +13,16 @@ from .config import parse_config
 
 def main():
     """
-    Application entrypoint (REVERTED VERSION).
+    Application entrypoint.
 
     Required:
         --image-path    → 4D CTP NIfTI
         --mask-path     → Brain mask NIfTI
-        --vessel-path   → Vessel mask image
+        --vessel-path   → Vessel mask NIfTI
         --save-path     → Output folder
-
-    No DICOM preprocessing.
-    No dynamic input modes.
     """
     print(datestr())
     config = parse_config()
-
-    device = torch.device("cpu")
 
     # --- REQUIRED INPUTS ---
     if not config.image_path:
@@ -66,7 +58,6 @@ def main():
         direction=direction,
         config=config,
         save_path=config.save_path,
-        device=device,
     )
 
     calculator.run()
