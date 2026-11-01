@@ -100,10 +100,13 @@ def __getattr__(name):
             raw_4d : (Z, Y, X, T) array of the CT perfusion series.
             brain_mask, vessel_mask : (Z, Y, X) boolean arrays.
             settings : PerfusionSettings, or None for the validated defaults.
+                Working from arrays alone, `settings.tr` is required -- the
+                pipeline will not assume a frame interval -- and
+                `settings.voxel_spacing` sets the millimetre scale.
             save_path : optional directory; when given, NIfTIs are written
-                there as well as returned. Writing needs reference geometry,
-                so `settings.image_path` and `settings.mask_path` must point
-                at the source images.
+                there as well as returned. Writing copies headers from the
+                source images, so `settings.image_path` and
+                `settings.mask_path` must point at them.
 
             Returns
             -------

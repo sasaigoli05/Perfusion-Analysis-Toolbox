@@ -20,11 +20,20 @@ from typing import Any
 @dataclass
 class PerfusionSettings:
     # --- reference images -------------------------------------------------
-    # Only used to inherit geometry and timing for the written outputs. A
-    # caller working purely in memory can leave both None and pass `geometry`
-    # to the calculator instead.
+    # Source of geometry (spacing, origin, direction) and of timing. A caller
+    # working purely in memory leaves both None, states `tr`, and optionally
+    # gives `voxel_spacing`; writing NIfTIs needs them, computing maps does
+    # not.
     image_path: str | None = None
     mask_path: str | None = None
+
+    voxel_spacing: tuple[float, float, float] | None = None
+    """
+    Voxel size in mm as (x, y, z), for in-memory callers with no reference
+    image. Sets the in-plane smoothing scale and the motion-correction grid.
+    Ignored when image_path/mask_path are given, since the headers are then
+    authoritative.
+    """
 
     # --- timing -----------------------------------------------------------
     tr: float | None = None

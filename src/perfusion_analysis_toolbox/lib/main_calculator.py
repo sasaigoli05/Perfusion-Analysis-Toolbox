@@ -69,7 +69,10 @@ class MainCalculator:
 
     Image geometry (spacing, origin, direction) is read from the reference
     images at config.image_path / config.mask_path rather than passed in, so
-    the outputs always inherit the input headers.
+    the outputs always inherit the input headers. A caller working purely in
+    memory leaves both None and states config.tr, optionally with
+    config.voxel_spacing; writing NIfTIs then has no headers to copy and is
+    refused.
     """
 
     def __init__(
@@ -284,6 +287,15 @@ class MainCalculator:
             print(f"[MAIN] TR = {tr:.4f}s (from --tr)")
             return self._check_tr(tr)
 
+        if not self.image_path:
+            raise ValueError(
+                "No frame interval available: set PerfusionSettings.tr when "
+                "calling with arrays rather than file paths. The pipeline "
+                "does not assume one -- a wrong TR silently corrupts AIF "
+                "gating, Tmax, MTT and CBF while still producing plausible "
+                "maps."
+            )
+
         image_dir = os.path.dirname(os.path.abspath(self.image_path))
         for name in sorted(glob.glob(os.path.join(image_dir, "acquisition_*.json"))):
             try:
@@ -344,6 +356,26 @@ class MainCalculator:
     # ------------------------------------------------------------------
     # Internal helper: in-plane voxel size from image metadata
     # ------------------------------------------------------------------
+    def _voxel_spacing(self, ref_4d, ref_3d):
+        """
+        Voxel size in mm as (x, y, z), from whichever source exists.
+
+        The header wins when there is one. An in-memory caller supplies it
+        through PerfusionSettings.voxel_spacing; without that, isotropic
+        1 mm is assumed, which leaves motion correction working in voxels
+        rather than millimetres.
+        """
+        for ref in (ref_4d, ref_3d):
+            if ref is not None:
+                sp = [float(v) for v in list(ref.GetSpacing())[:3]]
+                if len(sp) == 3 and all(v > 0 for v in sp):
+                    return sp
+        configured = getattr(self.config, "voxel_spacing", None)
+        if configured:
+            return [float(v) for v in configured][:3]
+        print("[MAIN] No voxel spacing available; assuming 1mm isotropic.")
+        return [1.0, 1.0, 1.0]
+
     def _in_plane_voxel_size_mm(self, ref_img) -> float:
         """
         Mean in-plane voxel size (mm) from the reference image spacing.
@@ -352,7 +384,8 @@ class MainCalculator:
         two. Falls back to DEFAULT_VOXEL_SIZE_MM when the header carries no
         real spacing (e.g. a synthetic image left at unit spacing).
         """
-        sp = list(ref_img.GetSpacing())
+        sp = (list(ref_img.GetSpacing()) if ref_img is not None
+              else list(getattr(self.config, "voxel_spacing", None) or ()))
         in_plane = [float(v) for v in sp[:2] if float(v) > 0]
         if len(in_plane) != 2:
             print(
@@ -388,9 +421,12 @@ class MainCalculator:
     def main_cal(self):
         print("\n[MAIN] Starting perfusion pipeline...")
 
-        # Load reference images
-        ref_3d = itk.imread(self.mask_path)
-        ref_4d = itk.imread(self.image_path)
+        # Load reference images. A caller working purely in memory has no
+        # files to read; it states the frame interval and, optionally, the
+        # voxel spacing instead. Geometry is only strictly required to write
+        # NIfTIs, which is checked at the point of writing.
+        ref_3d = itk.imread(self.mask_path) if self.mask_path else None
+        ref_4d = itk.imread(self.image_path) if self.image_path else None
 
         tr = self._resolve_tr(ref_4d)
 
@@ -400,9 +436,7 @@ class MainCalculator:
         # bone edges through voxels, which then present as huge spurious
         # enhancement and can win AIF selection outright.
         if getattr(self.config, "motion_correction", True):
-            spacing = list(ref_4d.GetSpacing())[:3] or list(
-                ref_3d.GetSpacing()
-            )
+            spacing = self._voxel_spacing(ref_4d, ref_3d)
             self.raw_perf, motion = moco.correct_motion(self.raw_perf, spacing)
             if self.savepath:
                 with open(f"{self.savepath}/motion.json", "w") as fh:
@@ -521,6 +555,13 @@ class MainCalculator:
             print("[MAIN] Pipeline complete (in-memory).\n")
             return PerfusionMaps(cbf=CBF, cbv=CBV, mtt=MTT, tmax=TMAX,
                                  ctc=CTC, aif=AIF, extras=dict(extras))
+        if ref_3d is None:
+            raise ValueError(
+                "Cannot write NIfTIs without reference geometry: set "
+                "PerfusionSettings.image_path and .mask_path so the outputs "
+                "inherit the input headers, or drop save_path and take the "
+                "maps from the returned PerfusionMaps."
+            )
         print("[MAIN] Writing NIfTI outputs to:", self.savepath)
         self._write_like(CBF, ref_3d, f"{self.savepath}/cbf.nii.gz")
         self._write_like(CBV, ref_3d, f"{self.savepath}/cbv.nii.gz")

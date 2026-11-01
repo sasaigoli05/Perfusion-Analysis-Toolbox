@@ -257,3 +257,72 @@ def test_usable_mask_is_not_a_fallback(tmp_path):
     assert rec["used_fallback"] is False
     assert rec["aif_selection"] == "external_mask"
     assert rec["gates"]["n_in_mask"] == int(arterial.sum())
+
+
+# ------------------------------------------------------- in-memory library use
+#
+# The point of the package API is that another pipeline can hand it arrays and
+# get arrays back, with no files anywhere. That path used to raise: the
+# calculator read its reference geometry from config.image_path unconditionally,
+# so a caller with no paths hit `itk.imread(None)`. These pin the contract.
+
+
+def _synthetic_series(nz=4, ny=20, nx=20, nt=30, tr=1.5, seed=0):
+    """A raw 4D series with an arterial region leading the tissue."""
+    rng = np.random.default_rng(seed)
+    brain = np.zeros((nz, ny, nx), bool)
+    brain[1:3, 3:-3, 3:-3] = True
+    vessel = np.zeros((nz, ny, nx), bool)
+    vessel[1:3, 6:10, 6:11] = True
+
+    t = np.arange(nt, dtype=float) * tr
+
+    def bolus(amp, start):
+        c = np.zeros(nt)
+        late = t > start
+        c[late] = ((t[late] - start) ** 3) * np.exp(-(t[late] - start) / 2.0)
+        return c / (c.max() or 1.0) * amp
+
+    raw = np.full((nz, ny, nx, nt), 40.0)
+    raw[vessel] += bolus(300.0, 6.0)
+    raw[brain & ~vessel] += bolus(60.0, 10.5)
+    raw += rng.normal(0, 1.0, raw.shape)
+    return raw, brain, vessel
+
+
+def test_compute_perfusion_runs_from_arrays_alone():
+    from perfusion_analysis_toolbox import PerfusionSettings, compute_perfusion
+
+    raw, brain, vessel = _synthetic_series()
+    maps = compute_perfusion(
+        raw, brain, vessel,
+        PerfusionSettings(tr=1.5, voxel_spacing=(0.39, 0.39, 4.0)),
+    )
+    for name in ("cbf", "cbv", "mtt", "tmax"):
+        arr = getattr(maps, name)
+        assert arr.shape == brain.shape, name
+        assert np.isfinite(arr).all(), name
+    # The AIF must have been fitted on the stated time base, not a default.
+    assert maps.aif["TR"] == 1.5
+
+
+def test_in_memory_call_still_refuses_to_guess_the_frame_interval():
+    from perfusion_analysis_toolbox import PerfusionSettings, compute_perfusion
+
+    raw, brain, vessel = _synthetic_series()
+    # No tr and no image_path to read one from. Assuming a value here is the
+    # failure mode the timing work exists to prevent, so this must raise.
+    with pytest.raises(ValueError, match="frame interval"):
+        compute_perfusion(raw, brain, vessel, PerfusionSettings())
+
+
+def test_writing_without_reference_geometry_is_refused(tmp_path):
+    from perfusion_analysis_toolbox import PerfusionSettings, compute_perfusion
+
+    raw, brain, vessel = _synthetic_series()
+    # NIfTI outputs inherit the input headers; with no reference image there
+    # are none to inherit, and writing a map with invented geometry would be
+    # worse than not writing it.
+    with pytest.raises(ValueError, match="reference geometry"):
+        compute_perfusion(raw, brain, vessel, PerfusionSettings(tr=1.5),
+                          save_path=str(tmp_path / "out"))
