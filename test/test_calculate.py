@@ -30,7 +30,10 @@ def test_import():
 def test_calc():
     from perfusion_analysis_toolbox.main import main
 
-    argv = ["pyproject.toml", "--save-path", TEST_OUTPUT_DIR]
+    # The test fixtures carry no acquisition timing, and the pipeline refuses
+    # to guess a frame interval rather than silently assume one, so the test
+    # states it explicitly the same way a caller with a bare NIfTI would.
+    argv = ["pyproject.toml", "--save-path", TEST_OUTPUT_DIR, "--tr", "1.5"]
     for data_info in test_data_info:
         argv.append(data_info.config_param)
         argv.append(data_info.filepath)
