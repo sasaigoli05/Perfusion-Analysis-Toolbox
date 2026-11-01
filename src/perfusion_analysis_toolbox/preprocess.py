@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+import json
 import subprocess, shutil, time
 import numpy as np
 
@@ -22,7 +23,21 @@ MIN_PRE_FRAMES = 3
 K_STD = 2.0
 MORPH_RADIUS = (1, 1, 1)
 KEEP_LARGEST_CC = True
-ERODE_BRAIN_VOX = 2
+# Brain-mask erosion, in millimetres rather than voxels.
+#
+# CTP voxels are wildly anisotropic -- 0.39mm in-plane against 4mm (sometimes
+# 10mm) slices -- so an erosion radius expressed in voxels means two entirely
+# different operations along different axes. The previous isotropic 2-voxel
+# radius trimmed 0.78mm in-plane as intended but 8mm through-plane, removing
+# two whole slices from each end of the stack: 18% of a 22-slice brain and 40%
+# of a 10-slice one. Measured against the vendor brain mask across 16 studies,
+# that accounted for a mean 22% of brain volume lost, and the per-study deficit
+# tracked 4/n_slices at r=0.88.
+#
+# Expressed in mm it converts to 2 voxels in-plane and 0 through-plane, which
+# is the same in-plane behaviour as before and matches the convention already
+# used for CTC smoothing (in-plane only, slice axis skipped).
+ERODE_BRAIN_MM = 0.78
 SOFT_TISSUE_RANGE = (-20, 80)
 # =============================
 
@@ -121,8 +136,136 @@ def _find_pre_and_ttp(arr4d: np.ndarray, mask: np.ndarray) -> tuple[int, int]:
     return pre, ttp
 
 
+def _erode_radius(spacing_xyz, erode_mm: float | None = None) -> tuple[int, int, int]:
+    """
+    Erosion radius in voxels per axis for a fixed physical radius.
+
+    Rounds ERODE_BRAIN_MM into each axis independently, so an axis whose
+    spacing already exceeds the radius erodes by zero rather than by a whole
+    slice. Returns ITK index order (x, y, z).
+    """
+    mm = ERODE_BRAIN_MM if erode_mm is None else float(erode_mm)
+    radius = []
+    for sp in spacing_xyz[:3]:
+        sp = float(sp)
+        radius.append(int(round(mm / sp)) if sp > 0 else 0)
+    return (radius[0], radius[1], radius[2])
+
+
+def _stamp_tr(nii_path: Path, tr_s: float) -> None:
+    """Write the measured frame interval into the NIfTI header's pixdim[4]."""
+    import nibabel as nib
+
+    img = nib.load(str(nii_path))
+    zooms = list(img.header.get_zooms())
+    if len(zooms) < 4:
+        return
+    zooms[3] = float(tr_s)
+    img.header.set_zooms(tuple(zooms))
+    nib.save(img, str(nii_path))
+
+
+# ---------- Acquisition timing ----------
+def _dicom_time_to_seconds(value: str) -> float:
+    """DICOM TM value (HHMMSS.FFFFFF) to seconds since midnight."""
+    t = f"{float(value):013.6f}"
+    return int(t[0:2]) * 3600 + int(t[2:4]) * 60 + float(t[4:])
+
+
+def derive_tr_seconds(dicom_dir: Path) -> dict:
+    """
+    Frame interval in seconds, measured from the DICOM acquisition times.
+
+    This is the only trustworthy source. The pipeline previously assumed
+    TR = 1.5s for every study, so a cohort that happens to sample at 1.5s looks
+    healthy while any other protocol silently gets wrong AIF timing, wrong
+    lead-time gates, wrong Tmax and wrong CBF, with maps that still look
+    plausible. dcm2niix writes an estimate into pixdim[4], but it is the mean
+    rate rather than the sampling interval and disagrees on non-uniform
+    protocols, so it is only a fallback.
+
+    Timing is built per *volume*, not per slice. A toggling-table 4D
+    acquisition samples different slice positions at different points in the
+    cycle, so intervals measured at a single slice location range from 0.2s to
+    2.9s on the same study that is really sampling at 1.5s. Each frame's time
+    is taken as the median across slice positions, and the intervals come from
+    that.
+
+    `uniform` reports whether one scalar TR describes the acquisition at all.
+    Dense-early/sparse-late protocols exist, and the rest of the pipeline
+    assumes a constant interval -- when this is False, timing-derived outputs
+    (Tmax, MTT, the AIF fit) are approximations.
+    """
+    import pydicom
+
+    by_z: dict[float, list[float]] = {}
+    for f in Path(dicom_dir).iterdir():
+        if f.is_dir():
+            continue
+        try:
+            d = pydicom.dcmread(str(f), stop_before_pixels=True)
+            z = round(float(d.ImagePositionPatient[2]), 3)
+            raw = getattr(d, "AcquisitionTime", None) or getattr(
+                d, "ContentTime", None
+            )
+            if raw is None:
+                continue
+            by_z.setdefault(z, []).append(_dicom_time_to_seconds(str(raw)))
+        except Exception:
+            continue
+
+    if not by_z:
+        raise ValueError(f"no readable acquisition times under {dicom_dir}")
+
+    n_frames = min(len(v) for v in by_z.values())
+    if n_frames < 2:
+        raise ValueError("need at least two time points to measure TR")
+
+    per_slice = np.array([sorted(by_z[z])[:n_frames] for z in sorted(by_z)])
+    volume_times = np.median(per_slice, axis=0)
+    deltas = np.diff(volume_times)
+
+    tr = float(np.median(deltas))
+    if not (0.1 <= tr <= 30.0):
+        raise ValueError(f"implausible TR measured: {tr:.3f}s")
+
+    cv = float(np.std(deltas) / np.mean(deltas))
+
+    return {
+        "tr_s": tr,
+        "tr_mean_s": float(np.mean(deltas)),
+        "tr_min_s": float(np.min(deltas)),
+        "tr_max_s": float(np.max(deltas)),
+        "tr_cv": cv,
+        "uniform": bool(cv <= 0.10),
+        "n_frames": int(n_frames),
+        "n_slices": len(by_z),
+        "duration_s": float(volume_times[-1] - volume_times[0]),
+        "source": "dicom_acquisition_time",
+    }
+
+
 # ---------- Brain mask (skull-free + eroded) ----------
-def _make_brain_mask(nii_path: Path, out_mask_path: Path) -> Path:
+def _make_brain_mask(
+    nii_path: Path,
+    out_mask_path: Path,
+    hu_range: tuple[float, float] | None = None,
+    erode_mm: float | None = None,
+) -> Path:
+    """
+    Brain mask from the pre-bolus baseline.
+
+    hu_range and erode_mm default to the module constants; they are exposed so
+    a cohort run can sweep them without editing code between runs.
+
+    On the HU floor: the default of -20 admits CSF and extra-axial fluid at the
+    brain periphery, which carry no perfusion. Those voxels drag the brain
+    median that rCBF is normalised by, and then score as ischaemic core
+    themselves. Raising the floor removes them. It cannot remove ischaemic
+    tissue -- measured across 5 studies with a vendor core segmentation, core
+    baseline HU runs 35-42 against 44-51 for normal brain, and 0.0% of core
+    voxels fall below 20 HU.
+    """
     if sitk is None:
         raise ImportError(
             "SimpleITK is required for brain masking. pip install SimpleITK"
@@ -144,7 +287,7 @@ def _make_brain_mask(nii_path: Path, out_mask_path: Path) -> Path:
     base.SetSpacing(spacing3)
     base.SetDirection(direction3)
 
-    low, high = SOFT_TISSUE_RANGE
+    low, high = hu_range if hu_range is not None else SOFT_TISSUE_RANGE
     soft = sitk.BinaryThreshold(
         base,
         lowerThreshold=float(low),
@@ -158,7 +301,12 @@ def _make_brain_mask(nii_path: Path, out_mask_path: Path) -> Path:
     cc = sitk.ConnectedComponent(soft)
     soft = sitk.RelabelComponent(cc, sortByObjectSize=True)
     soft = sitk.BinaryThreshold(soft, 1, 1, 1, 0)
-    brain_mask = sitk.BinaryErode(soft, (int(ERODE_BRAIN_VOX),) * 3)
+    brain_mask = sitk.BinaryErode(
+        soft,
+        _erode_radius(
+            spacing3, erode_mm if erode_mm is not None else ERODE_BRAIN_MM
+        ),
+    )
 
     sitk.WriteImage(brain_mask, str(out_mask_path))
     print(f"[OK] Brain mask saved: {out_mask_path}")
@@ -247,6 +395,26 @@ def preprocess_from_dicom(image_directory: str, save_path: str) -> dict:
 
     nii_path = _run_dcm2niix(dicom_dir, out_dir, ts)
 
+    # Measure the frame interval and stamp it into the NIfTI, so a downstream
+    # run reads the acquisition's real timing instead of assuming one.
+    timing = derive_tr_seconds(dicom_dir)
+    timing_path = out_dir / f"acquisition_{ts}.json"
+    timing_path.write_text(json.dumps(timing, indent=2))
+    _stamp_tr(nii_path, timing["tr_s"])
+    print(
+        f"[CTP] TR = {timing['tr_s']:.4f}s measured from acquisition times "
+        f"({timing['n_frames']} frames, {timing['n_slices']} slices, "
+        f"range {timing['tr_min_s']:.3f}-{timing['tr_max_s']:.3f}s)"
+    )
+    if not timing["uniform"]:
+        print(
+            f"[CTP] WARNING: non-uniform sampling (CV={timing['tr_cv']:.2f}, "
+            f"{timing['tr_min_s']:.2f}-{timing['tr_max_s']:.2f}s). This "
+            f"acquisition changes rate partway through -- likely dense early, "
+            f"sparse late. The pipeline models a constant interval, so Tmax, "
+            f"MTT and the AIF fit are approximations for this study."
+        )
+
     brain_mask_path = out_dir / f"brain_mask_{ts}.nii.gz"
     _make_brain_mask(nii_path, brain_mask_path)
 
@@ -263,6 +431,8 @@ def preprocess_from_dicom(image_directory: str, save_path: str) -> dict:
         "image_path": str(nii_path),
         "mask_path": str(brain_mask_path),
         "vessel_path": str(vessel_mask_path),
+        "timing_path": str(timing_path),
+        "tr_s": timing["tr_s"],
     }
 
 
