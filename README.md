@@ -53,38 +53,77 @@ perfusion-compute-cli -h
 
 ## 🧠 Usage
 
-### Option A: Direct NIfTI inputs
-
-If you already have 4D perfusion and 3D mask/vessel NIfTI files:
+### Recommended: one command, DICOM to quality-controlled maps
 
 ```bash
-perfusion-compute-cli \
-  --image-path  /path/to/perfusion_4D.nii.gz \
-  --mask-path   /path/to/brain_mask_3D.nii.gz \
-  --vessel-path /path/to/vessel_centerlines_3D.nii.gz \
-  --save-path   /path/to/output_dir
+python -m perfusion_analysis_toolbox.run_study /path/to/ctp_dicom_dir /path/to/output
+```
+
+This converts the series, **measures the frame interval from the DICOM
+acquisition times**, builds the brain and vessel masks, computes the maps, and
+writes a QC report. It exits non-zero if QC fails.
+
+Outputs land in `<output>/maps/`, with `<output>/provenance.json` recording the
+settings, the measured acquisition timing and the QC verdict.
+
+### Acquisition timing
+
+The frame interval is measured, never assumed. Timing is built per *volume* —
+each frame's time is the median across slice positions — because a
+toggling-table 4D acquisition samples different slices at different points in
+the cycle, and intervals measured at a single slice location can range from
+0.2 s to 2.9 s on a study that is really sampling at 1.5 s.
+
+If the timing cannot be determined, the pipeline **refuses to run** rather than
+defaulting. Guessing silently corrupts AIF lead-time gating, Tmax, MTT and CBF
+while still producing plausible-looking maps. Supply it explicitly when working
+from a bare NIfTI:
+
+```bash
+python -m perfusion_analysis_toolbox.run_study /dicom /out --tr 1.5
+```
+
+Non-uniform acquisitions (dense early, sparse late) are detected and warned
+about. The pipeline models a constant interval, so timing-derived outputs are
+approximations on those studies.
+
+### Quality control
+
+```bash
+python -m perfusion_analysis_toolbox.qc /path/to/output/maps /path/to/brain_mask.nii.gz
+```
+
+These are **plausibility** checks — non-arterial AIF, excessive motion,
+implausible brain volume, degenerate maps — not accuracy predictions. That
+distinction is measured, not assumed: across a 16-study cohort no
+reference-free signal predicted map accuracy, and the strongest apparent
+predictor turned out to track lesion size rather than map quality.
+
+### Step by step
+
+To drive the stages separately, or to inspect the masks before computing maps:
+
+```bash
+python -m perfusion_analysis_toolbox.preprocess /path/to/dicom_dir /path/to/output
+```
+
+writes `image_<ts>.nii.gz`, `acquisition_<ts>.json`, `brain_mask_<ts>.nii.gz`
+and `vessel_mask_<ts>.nii.gz` into `<output>/preprocess/`. Then:
+
+```bash
+perfusion-compute-cli --image-path <4d.nii.gz> --mask-path <brain_mask.nii.gz> --vessel-path <vessel_mask.nii.gz> --save-path <out>
 ```
 
 Tuning flags: `--svd_frac` (truncated-SVD threshold, default `0.20`),
-`--kh` and `--rho` (haematocrit and tissue-density factors scaling CBV).
-
-### Option B: DICOM inputs
-
-To convert a DICOM study and generate the brain and vessel masks first:
-
-```bash
-python -m perfusion_analysis_toolbox.preprocess /path/to/dicom_dir /path/to/output_dir
-```
-
-This writes `perfusion_4d.nii.gz`, `brain_mask_<timestamp>.nii.gz` and
-`vessel_mask_<timestamp>.nii.gz` into `<output_dir>/preprocess/`. Inspect the
-masks, then pass them to `perfusion-compute-cli` as in Option A.
+`--deconv-method` (`svd`, `osvd`, `osvd_oi`), `--smooth-fwhm` (in-plane
+smoothing FWHM in mm, default `4.0`), `--denoise-method`, `--tr`, and `--kh` /
+`--rho` for CBV scaling.
 
 ### Optional: atlas-based AIF slice selection
 
-The registration-based arterial mask (`lib/ParamsCalculator/register.py`) needs a
-reference atlas, which is **not** distributed with this repository. Point it at
-your own copy and make sure the `unicarl` conda env is available with CUDA:
+The registration-based arterial mask (`lib/ParamsCalculator/register.py`) needs
+a reference atlas, which is **not** distributed with this repository. Point it
+at your own copy and make sure the `unicarl` conda env is available with CUDA:
 
 ```bash
 export PERFUSION_ATLAS_PATH=/path/to/atlas.nii.gz
@@ -92,10 +131,9 @@ export PERFUSION_ATLAS_PATH=/path/to/atlas.nii.gz
 
 When set, the warped ICA-level mask is intersected with the intensity-based
 vessel mask to constrain AIF voxel search. If the variable is unset, if
-registration fails, or if the overlap is too small, the pipeline silently falls
-back to the intensity-based vessel mask alone.
+registration fails, or if the overlap is too small, the pipeline falls back to
+the intensity-based vessel mask alone. This path is **not validated**.
 
----
 
 ## 📊 Outputs
 
@@ -120,58 +158,101 @@ When atlas registration is enabled, `firstvolume.nii.gz` and the cached
 
 **Research prototype — not validated for quantitative or clinical use.**
 
-Benchmarked against a commercial reference pipeline on an internal cohort of
-6 CTP studies. Numbers are agreement with that reference, which is itself a
-commercial product with its own modelling assumptions, not ground truth.
+Benchmarked against Cercare Medical Neurosuite on an internal cohort of 16 CTP
+studies. Cercare is a commercial product with its own modelling assumptions,
+not ground truth.
 
-| Measure                                     | Result                  |
-| ------------------------------------------- | ----------------------- |
-| Spatial correlation of rCBF (5 of 6 studies)| r = 0.59 – 0.77         |
-| Spatial correlation (1 of 6 studies)        | r ≈ 0 — outright failure |
-| Ischemic core overlap, Dice                 | 0.31 mean (0.06 – 0.58) |
-| Core volume as fraction of reference        | 30% mean (13% – 62%)    |
+### Choosing the reference
+
+Each export carries two things that could be called "the reference", and they
+are not interchangeable:
+
+| Series | What it is |
+| ------ | ---------- |
+| `parametric-cbf-…` | the vendor's `rCBF [CMN]` map |
+| `ct-core-lesion-…` | the vendor's trained **AI** core segmentation |
+
+The AI segmentation is a median **0.28×** the volume of the vendor's own rCBF
+map cut at rCBF<0.30. Scoring a threshold-based pipeline against it charges
+this pipeline for the vendor model's conservatism, and it makes Dice degenerate
+on studies where the AI declares no infarct at all. Results below therefore use
+the **vendor rCBF map under the identical rCBF<0.30 rule**; the AI numbers are
+reported alongside as a secondary figure.
+
+### Results
+
+Best configuration (vendor-preprocessed input, vendor brain mask,
+`--deconv svd`, `svd_frac=0.20`):
+
+| Measure | Result |
+| ------- | ------ |
+| Spatial correlation of rCBF | r = 0.895 ± 0.050 |
+| Core Dice vs vendor rCBF map | 0.552 ± 0.170 |
+| Core Dice vs vendor AI segmentation | 0.425 |
+| Core volume vs reference | 0.65× (IQR 0.51–0.79) |
+| Studies below Dice 0.30 | 2 of 16 |
+
+Across all four input/mask configurations (64 runs), mean Dice against the
+rCBF map is 0.457 ± 0.205.
 
 ### What this means
 
-**Working:** the spatial *pattern* of cerebral blood flow broadly tracks the
-reference in 5 of 6 studies — regions of high and low perfusion appear in
-approximately the right places.
+**Working:** the spatial pattern of cerebral blood flow tracks the reference
+closely and consistently. No study in this cohort fails outright — the
+previously reported "1 in 6 fails completely, and which one cannot be
+determined in advance" does not reproduce here, and was substantially an
+artifact of scoring against the AI segmentation.
 
-**Not working:** absolute scale is uncalibrated. Ischemic core volumes are
-systematically underestimated by roughly 3× and the core overlap (Dice 0.31)
-is well below the ~0.7 that would indicate two segmentations agree. The gap
-between good correlation and poor overlap is the signature of a scale offset:
-the shape of the perfusion map is approximately right, so any absolute
-threshold applied to it lands in the wrong place.
+**Not working:** core volume is systematically under-called at 0.65× the
+reference under an identical threshold rule. The optimal threshold sits at
+0.413 rather than the clinical 0.300, and rethresholding recovers +0.123 Dice.
 
-**Unpredictable:** one study in six fails completely, and which one cannot
-currently be determined in advance.
+**Do not use Pearson r as a quality gate.** It reads 0.90+ on runs whose Dice
+is 0.001. It measures pattern agreement and is insensitive to the scaling
+errors that determine whether a threshold lands in the right place.
 
-### Appropriate use
+### Where the residual error comes from
 
-Suitable for method development, algorithm experimentation, and qualitative
-visual comparison.
+The rCBF distribution is compressed toward its median from both ends —
+low percentiles sit ~18% too high, high percentiles ~29% too low. Two
+candidate causes have been ruled out:
 
-Not suitable for lesion volumetry, per-patient quantitative endpoints, or any
-clinical decision.
+- **Deconvolution regularisation.** Core volume ratio is invariant across
+  `svd_frac` 0.002–0.50 and `osvd_oi` (0.53 / 0.55 / 0.54 / 0.39). The
+  shipped default of 0.20 outperforms every alternative tested.
+- **Arterial calibration / partial-volume correction.** rCBF normalises by
+  the map's own brain median, so any global scale factor — AIF amplitude
+  included — cancels exactly and cannot move this number.
+
+The low tail is instead reproduced by **spatial smoothing**: blurring the
+vendor's own map by 4–6 mm FWHM in-plane collapses its distribution onto ours
+(p5 0.225 vs our 0.228, p10 0.295 vs 0.303, frac<0.30 0.111 vs 0.107). The
+pipeline applies `SMOOTH_FWHM_MM = 4.0` before deconvolution. The high tail is
+not fully explained by blur and remains open.
 
 ### Known limitations
 
+- Core volume under-call is unresolved. Reducing the pre-deconvolution
+  smoothing is the untested lead; it trades against noise, which the
+  `svd_frac=0.002` experiment showed is severely destructive.
 - The gamma-variate AIF refinement loop has no convergence criterion; it runs
   a fixed iteration count and the shape-parameter clamp can absorb divergence
-  rather than surfacing it. This is the leading suspect for the failure mode
-  above.
-- A fit-sanity gate rejects degenerate AIF fits (collapsed amplitude, or
-  parameters resting on a clamp bound) and warns when none survive. It
-  prevents a bad fit from passing silently, but cannot manufacture a good one
-  when the candidate pool is too narrow.
-- Atlas-constrained AIF selection is implemented but **not validated** — on
-  the cohort above it narrows the candidate pool enough to degrade results.
-  It is off by default.
-- Systematic core underestimation is unresolved and likely requires arterial
-  calibration / partial-volume correction.
+  rather than surfacing it.
+- A fit-sanity gate rejects degenerate AIF fits and warns when none survive.
+  It prevents a bad fit passing silently but cannot manufacture a good one.
+- Atlas-constrained AIF selection is implemented but **not validated** — on an
+  earlier cohort it narrowed the candidate pool enough to degrade results. Off
+  by default.
 
----
+### Reproducing
+
+```bash
+python -m tools.cohort.run_cohort --data-root /path/to/exports
+python -m tools.cohort.summarize
+```
+
+`--rescore` recomputes metrics from existing outputs without re-running
+deconvolution; `--skip-existing` resumes an interrupted cohort.
 
 ## 🧩 Reproducibility
 
