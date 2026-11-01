@@ -9,6 +9,7 @@ from .lib.utils import datestr
 from .lib.signal_reader import read_signal
 from .lib.main_calculator import MainCalculator
 from .config import parse_config
+from .settings import PerfusionSettings
 
 
 def main():
@@ -42,21 +43,26 @@ def main():
     vessel_path = config.vessel_path
 
     # --- LOAD RAW SIGNAL + MASKS ---
-    RawPerfImg, mask, vessels, origin, spacing, direction = read_signal(
+    # Geometry is returned but not forwarded: MainCalculator re-reads the
+    # image from config.image_path to get its ITK metadata, so passing origin,
+    # spacing and direction here would duplicate that -- and did not match its
+    # signature.
+    RawPerfImg, mask, vessels, _origin, _spacing, _direction = read_signal(
         image_path,
         mask_path,
         vessel_path,
     )
 
     # --- RUN PERFUSION CALCULATIONS ---
+    # The CLI parses into a Namespace; the calculator takes settings, so that
+    # library callers never have to build an argparse object.
+    settings = PerfusionSettings.from_namespace(config)
+
     calculator = MainCalculator(
         raw_perf=RawPerfImg,
         mask=mask,
         vessels=vessels,
-        origin=origin,
-        spacing=spacing,
-        direction=direction,
-        config=config,
+        config=settings,
         save_path=config.save_path,
     )
 
