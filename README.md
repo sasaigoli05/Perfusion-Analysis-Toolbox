@@ -244,16 +244,6 @@ not fully explained by blur and remains open.
   earlier cohort it narrowed the candidate pool enough to degrade results. Off
   by default.
 
-### Reproducing
-
-```bash
-python -m tools.cohort.run_cohort --data-root /path/to/exports
-python -m tools.cohort.summarize
-```
-
-`--rescore` recomputes metrics from existing outputs without re-running
-deconvolution; `--skip-existing` resumes an interrupted cohort.
-
 ## 🧩 Reproducibility
 
 The environment is defined in [`environment.yml`](./environment.yml) and includes:
